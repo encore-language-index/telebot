@@ -1,0 +1,458 @@
+//! Request serialization and response envelopes; no networking or application state.
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+import core::vec::Vec
+import json::Json
+import telebot::errors::{BotError, ErrorKind, error}
+import telebot::models::{field, boolean, optional_integer, text}
+import std::http::HTTPError
+import std::http::codec::{find, endpoint}
+import std::http::{HttpResponse, HttpHeader}
+
+pub enum ChatId {
+    Id(i64)
+    Username(str)
+}
+pub enum ButtonAction {
+    Url(str)
+    Callback(str)
+}
+pub struct InlineKeyboardButton {
+    text: str
+    action: ButtonAction
+}
+pub struct InlineKeyboardMarkup {
+    rows: Vec[Vec[InlineKeyboardButton]]
+}
+pub enum ParseMode {
+    Html
+    MarkdownV2
+}
+pub struct SendMessage {
+    chat_id: ChatId
+    text: str
+    parse_mode: Option[ParseMode]
+    reply_markup: Option[InlineKeyboardMarkup]
+    disable_notification: Option[bool]
+}
+
+impl for SendMessage {
+    pub fn new(chat_id: ChatId, text: str) -> Self {
+        ret Self {
+            chat_id, text, Option[ParseMode]::None, Option[InlineKeyboardMarkup]::None, Option[bool]::None
+        }
+    }
+    pub fn with_keyboard(self: Self, keyboard: InlineKeyboardMarkup) -> Self {
+        ret Self {
+            self.chat_id, self.text, self.parse_mode, Option::Some(keyboard), self.disable_notification
+        }
+    }
+    pub fn with_parse_mode(self: Self, mode: ParseMode) -> Self {
+        ret Self {
+            self.chat_id, self.text, Option::Some(mode), self.reply_markup, self.disable_notification
+        }
+    }
+    pub fn silent(self: Self, silent: bool) -> Self {
+        ret Self {
+            self.chat_id, self.text, self.parse_mode, self.reply_markup, Option::Some(silent)
+        }
+    }
+}
+pub struct EditMessageText {
+    chat_id: ChatId
+    message_id: i64
+    text: str
+    parse_mode: Option[ParseMode]
+    reply_markup: Option[InlineKeyboardMarkup]
+}
+
+impl for EditMessageText {
+    pub fn new(chat_id: ChatId, message_id: i64, text: str) -> Self {
+        ret Self {
+            chat_id, message_id, text, Option[ParseMode]::None, Option[InlineKeyboardMarkup]::None
+        }
+    }
+    pub fn with_keyboard(self: Self, keyboard: InlineKeyboardMarkup) -> Self {
+        ret Self {
+            self.chat_id, self.message_id, self.text, self.parse_mode, Option::Some(keyboard)
+        }
+    }
+    pub fn with_parse_mode(self: Self, mode: ParseMode) -> Self {
+        ret Self {
+            self.chat_id, self.message_id, self.text, Option::Some(mode), self.reply_markup
+        }
+    }
+}
+pub struct GetUpdates {
+    offset: Option[i64]
+    limit: u8
+    timeout: u32
+    allowed_updates: Option[Vec[str]]
+}
+
+impl for GetUpdates {
+    pub fn default() -> Self {
+        ret Self {
+            Option[i64]::None, 100_u8, 30_u32, Option[Vec[str]]::None
+        }
+    }
+    pub fn with_offset(self: Self, offset: i64) -> Self {
+        ret Self {
+            Option::Some(offset), self.limit, self.timeout, self.allowed_updates
+        }
+    }
+    pub fn with_timeout(self: Self, seconds: u32) -> Self {
+        ret Self {
+            self.offset, self.limit, seconds, self.allowed_updates
+        }
+    }
+    pub fn with_allowed_updates(self: Self, updates: Vec[str]) -> Self {
+        ret Self {
+            self.offset, self.limit, self.timeout, Option::Some(updates)
+        }
+    }
+}
+pub struct AnswerCallbackQuery {
+    callback_query_id: str
+    text: Option[str]
+    show_alert: Option[bool]
+    cache_time: Option[u32]
+}
+
+impl for AnswerCallbackQuery {
+    pub fn new(id: str) -> Self {
+        ret Self {
+            id, Option[str]::None, Option[bool]::None, Option[u32]::None
+        }
+    }
+    pub fn with_text(self: Self, text: str) -> Self {
+        ret Self {
+            self.callback_query_id, Option::Some(text), self.show_alert, self.cache_time
+        }
+    }
+    pub fn with_alert(self: Self, alert: bool) -> Self {
+        ret Self {
+            self.callback_query_id, self.text, Option::Some(alert), self.cache_time
+        }
+    }
+}
+pub fn number(value: i64) -> Json {
+    ret Json::Number(Debug::fmt(value))
+}
+pub fn chat(value: ChatId) -> Json {
+    ret match value {
+        ChatId::Id(value) => number(value) ChatId::Username(value) => Json::String(value)
+    }
+}
+pub fn keyboard(value: InlineKeyboardMarkup) -> Result[Json, BotError] {
+    let mut rows = Vec[Json]::new()
+    for row in value.rows {
+        let mut buttons = Vec[Json]::new()
+        for button in row {
+            if button.text == "" {
+                ret Result::Err(error(ErrorKind::Configuration, "button text is empty"))
+            }
+            let mut fields = vec![("text", Json::String(button.text))]
+            match button.action {
+                ButtonAction::Callback(data) => {
+                    if data.len() == 0_usize || data.len() > 64_usize {
+                        ret Result::Err(error(ErrorKind::Configuration, "callback data must contain 1 to 64 bytes"))
+                    }
+                    fields.push(("callback_data", Json::String(data)))
+                }
+                ButtonAction::Url(url) => {
+                    if url == "" {
+                        ret Result::Err(error(ErrorKind::Configuration, "button URL is empty"))
+                    }
+                    fields.push(("url", Json::String(url)))
+                }
+            }
+            buttons.push(Json::Object(fields))
+        }
+        if buttons.len() == 0_usize {
+            ret Result::Err(error(ErrorKind::Configuration, "empty inline keyboard row"))
+        }
+        rows.push(Json::Array(buttons))
+    }
+    ret Result::Ok(Json::Object(vec![("inline_keyboard", Json::Array(rows))]))
+}
+fn mode(value: ParseMode) -> Json {
+    ret Json::String(match value {
+            ParseMode::Html => "HTML" ParseMode::MarkdownV2 => "MarkdownV2"
+        }
+    )
+}
+pub fn send(value: SendMessage) -> Result[Json, BotError] {
+    if value.text == "" {
+        ret Result::Err(error(ErrorKind::Configuration, "message text is empty"))
+    }
+    let mut fields = vec![("chat_id", chat(value.chat_id)),("text", Json::String(value.text))]
+    match value.parse_mode {
+        Option::Some(value) => {
+            fields.push(("parse_mode", mode(value)))
+        }
+        Option::None => {
+        }
+    }
+    match value.reply_markup {
+        Option::Some(value) => {
+            fields.push(("reply_markup", keyboard(value)?))
+        }
+        Option::None => {
+        }
+    }
+    match value.disable_notification {
+        Option::Some(value) => {
+            fields.push(("disable_notification", Json::Bool(value)))
+        }
+        Option::None => {
+        }
+    }
+    ret Result::Ok(Json::Object(fields))
+}
+pub fn edit(value: EditMessageText) -> Result[Json, BotError] {
+    let encoded = send(SendMessage {
+            value.chat_id, value.text, value.parse_mode, value.reply_markup, Option[bool]::None
+        }
+        ,
+    )?
+    let mut fields = match encoded {
+        Json::Object(fields) => fields _ => Vec[(str, Json)]::new()
+    }
+    fields.push(("message_id", number(value.message_id)))
+    ret Result::Ok(Json::Object(fields))
+}
+pub fn updates(value: GetUpdates) -> Result[Json, BotError] {
+    if value.limit == 0_u8 || value.limit > 100_u8 || value.timeout > 3600_u32 {
+        ret Result::Err(error(ErrorKind::Configuration, "invalid polling limit or timeout"))
+    }
+    let mut fields = vec![("limit", number(value.limit as i64)),("timeout", number(value.timeout as i64))]
+    match value.offset {
+        Option::Some(value) => {
+            fields.push(("offset", number(value)))
+        }
+        Option::None => {
+        }
+    }
+    match value.allowed_updates {
+        Option::Some(value) => {
+            let mut updates = Vec[Json]::new()
+            for item in value {
+                updates.push(Json::String(item))
+            }
+            fields.push(("allowed_updates", Json::Array(updates)))
+        }
+        Option::None => {
+        }
+    }
+    ret Result::Ok(Json::Object(fields))
+}
+pub fn answer(value: AnswerCallbackQuery) -> Result[Json, BotError] {
+    if value.callback_query_id == "" {
+        ret Result::Err(error(ErrorKind::Configuration, "callback query ID is empty"))
+    }
+    let mut fields = vec![("callback_query_id", Json::String(value.callback_query_id))]
+    match value.text {
+        Option::Some(value) => {
+            fields.push(("text", Json::String(value)))
+        }
+        Option::None => {
+        }
+    }
+    match value.show_alert {
+        Option::Some(value) => {
+            fields.push(("show_alert", Json::Bool(value)))
+        }
+        Option::None => {
+        }
+    }
+    match value.cache_time {
+        Option::Some(value) => {
+            fields.push(("cache_time", number(value as i64)))
+        }
+        Option::None => {
+        }
+    }
+    ret Result::Ok(Json::Object(fields))
+}
+
+pub fn redact(message: str, token: str) -> str {
+    if token == "" {
+        ret message
+    }
+    let mut rest = message
+    let mut out = ""
+    loop {
+        let at = find(rest, token)
+        if at == rest.len() {
+            ret out + rest
+        }
+        out += rest.slice(0_usize, at) + "[redacted]"
+        rest = rest.slice(at + token.len(), rest.len() - at - token.len())
+    }
+}
+pub fn transport(value: HTTPError) -> BotError {
+    let mut out = error(ErrorKind::Transport, value.message)
+    out.transport = Option[HTTPError]::Some(value)
+    ret out
+}
+pub fn envelope(response: HttpResponse, token: str) -> Result[Json, BotError] {
+    let root = match json::parse(response.body()) {
+        Result::Ok(value) => value
+        Result::Err(_) => {
+            let mut failure = error(if response.status() >= 400_u16 {
+                    ErrorKind::Http
+                } else {
+                    ErrorKind::Protocol
+                }
+                , "Telegram response is not valid JSON",)
+            failure.http_status = response.status()
+            ret Result::Err(failure)
+        }
+    }
+    let ok = boolean(field(root, "ok")?)?
+    if !ok {
+        let code = optional_integer(root, "error_code")?
+        let description = text(field(root, "description")?)?
+        let params = root.get("parameters").unwrap_or(Json::Object(Vec[(str, Json)]::new()))
+        let mut failure = error(ErrorKind::Api, redact(description, token))
+        failure.http_status = response.status()
+        failure.api_code = code
+        failure.retry_after = optional_integer(params, "retry_after")?
+        failure.migrate_to_chat_id = optional_integer(params, "migrate_to_chat_id")?
+        ret Result::Err(failure)
+    }
+    if response.status() < 200_u16 || response.status() >= 300_u16 {
+        let mut failure = error(ErrorKind::Http, "unexpected HTTP status from Telegram")
+        failure.http_status = response.status()
+        ret Result::Err(failure)
+    }
+    ret field(root, "result")
+}
+
+pub fn validate_token(token: str) -> Result[bool, BotError] {
+    let colon = find(token, ":")
+    if colon == 0_usize || colon + 1_usize >= token.len() {
+        ret Result::Err(error(ErrorKind::Configuration, "invalid bot token"))
+    }
+    for i in 0_usize..colon {
+        if token.byte_at(i) < 48_u8 || token.byte_at(i) > 57_u8 {
+            ret Result::Err(error(ErrorKind::Configuration, "invalid bot token"))
+        }
+    }
+    let allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+    for i in colon + 1_usize..token.len() {
+        if find(allowed, token.slice(i, 1_usize)) == allowed.len() {
+            ret Result::Err(error(ErrorKind::Configuration, "invalid bot token"))
+        }
+    }
+    ret Result::Ok(true)
+}
+pub fn validate_base(base: str) -> Result[bool, BotError] {
+    if base == "" || base.slice(base.len() - 1_usize, 1_usize) == "/" || find(base, "?") != base.len() {
+        ret Result::Err(error(ErrorKind::Configuration, "API base must be an origin or prefix without a trailing slash or query"))
+    }
+    match endpoint(base) {
+        Result::Ok(_) => {
+            ret Result::Ok(true)
+        }
+        Result::Err(_) => {
+            ret Result::Err(error(ErrorKind::Configuration, "invalid Telegram API base"))
+        }
+    }
+}
+pub fn validate_file_path(path: str) -> Result[bool, BotError] {
+    if path == "" || path.byte_at(0_usize) == 47_u8 {
+        ret Result::Err(error(ErrorKind::Configuration, "invalid Telegram file path"))
+    }
+    let allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/."
+    let mut part = ""
+    for i in 0_usize..path.len() {
+        let ch = path.slice(i, 1_usize)
+        if find(allowed, ch) == allowed.len() {
+            ret Result::Err(error(ErrorKind::Configuration, "invalid Telegram file path"))
+        }
+        if ch == "/" {
+            if part == ".." || part == "." || part == "" {
+                ret Result::Err(error(ErrorKind::Configuration, "invalid Telegram file path"))
+            }
+            part = ""
+        } else {
+            part += ch
+        }
+    }
+    if part == ".." || part == "." || part == "" {
+        ret Result::Err(error(ErrorKind::Configuration, "invalid Telegram file path"))
+    }
+    ret Result::Ok(true)
+}
+
+#attr(test)
+fn optional_fields_and_unicode() -> bool {
+    let body = match send(SendMessage::new(ChatId::Id( - 1009007199254740993_i64), "Привет 👋")) {
+        Result::Ok(value) => value Result::Err(_) => {
+            ret false
+        }
+    }
+    ret body.get("parse_mode").is_none() && body.get("reply_markup").is_none()
+    && body.get("text").unwrap_or(Json::Null).as_str().unwrap_or("") == "Привет 👋"
+    && body.get("chat_id").unwrap_or(Json::Null).as_number().unwrap_or("") == "-1009007199254740993"
+}
+
+#attr(test)
+fn keyboard_callback_byte_limit() -> bool {
+    let good = InlineKeyboardMarkup {
+        vec![vec![InlineKeyboardButton {
+                    "Да", ButtonAction::Callback("approve:1")
+                }
+                , InlineKeyboardButton {
+                    "Источник", ButtonAction::Url("https://t.me/example/1")
+                }
+            ]]
+    }
+    if keyboard(good).is_err() {
+        ret false
+    }
+    let mut data = ""
+    for _i in 0_usize..33_usize {
+        data += "Я"
+    }
+    let bad = InlineKeyboardMarkup {
+        vec![vec![InlineKeyboardButton {
+                    "Too big", ButtonAction::Callback(data)
+                }
+            ]]
+    }
+    ret keyboard(bad).is_err()
+}
+
+#attr(test)
+fn telegram_api_error_metadata_and_redaction() -> bool {
+    let response = HttpResponse {
+        429_u16, "", Vec[HttpHeader]::new(), "{\"ok\":false,\"error_code\":429,\"description\":\"retry 123:TEST\",\"parameters\":{\"retry_after\":7,\"migrate_to_chat_id\":-1007}}"
+    }
+    match envelope(response, "123:TEST") {
+        Result::Ok(_) => {
+            ret false
+        }
+        Result::Err(error) => {
+            ret error.http_status == 429_u16 && error.api_code.unwrap_or(0_i64) == 429_i64
+            && error.retry_after.unwrap_or(0_i64) == 7_i64 && error.migrate_to_chat_id.unwrap_or(0_i64) == - 1007_i64
+            && error.message == "retry [redacted]"
+        }
+    }
+}
+
+#attr(test)
+fn malformed_envelopes_and_file_paths() -> bool {
+    if envelope(HttpResponse { 200_u16, "", Vec[HttpHeader]::new(), "{}" }, "123:TEST").is_ok() || envelope(HttpResponse {
+            500_u16, "", Vec[HttpHeader]::new(), "bad gateway"
+        }
+        , "123:TEST",).is_ok() {
+        ret false
+    }
+    ret validate_file_path("documents/CV_1.pdf").is_ok()
+    && validate_file_path("../secret").is_err() && validate_file_path("documents/%2e%2e/secret").is_err()
+    && validate_file_path("/absolute").is_err() && validate_token("123:TEST\r\n").is_err()
+}

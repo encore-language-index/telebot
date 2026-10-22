@@ -1,0 +1,321 @@
+//! A deliberately small typed subset; raw preserves fields from newer Bot API versions.
+import core::option::Option
+import core::result::Result
+import core::vec::Vec
+import json::Json
+import telebot::errors::{BotError, ErrorKind, error}
+
+pub struct User {
+    id: i64
+    is_bot: bool
+    first_name: str
+    last_name: Option[str]
+    username: Option[str]
+    raw: Json
+}
+pub struct Chat {
+    id: i64
+    kind: str
+    title: Option[str]
+    username: Option[str]
+    first_name: Option[str]
+    raw: Json
+}
+pub struct Document {
+    file_id: str
+    file_unique_id: str
+    file_name: Option[str]
+    mime_type: Option[str]
+    file_size: Option[i64]
+    raw: Json
+}
+pub struct File {
+    file_id: str
+    file_unique_id: str
+    file_size: Option[i64]
+    file_path: Option[str]
+    raw: Json
+}
+pub struct Message {
+    message_id: i64
+    date: i64
+    chat: Chat
+    from_user: Option[User]
+    text: Option[str]
+    caption: Option[str]
+    document: Option[Document]
+    raw: Json
+}
+pub struct CallbackQuery {
+    id: str
+    from_user: User
+    chat_instance: str
+    data: Option[str]
+    message: Option[Message]
+    inline_message_id: Option[str]
+    raw: Json
+}
+pub struct Update {
+    update_id: i64
+    message: Option[Message]
+    edited_message: Option[Message]
+    channel_post: Option[Message]
+    edited_channel_post: Option[Message]
+    callback_query: Option[CallbackQuery]
+    raw: Json
+}
+pub struct DownloadedFile {
+    bytes: str
+    size: usize
+}
+
+fn malformed() -> BotError {
+    ret error(ErrorKind::Protocol, "invalid or missing Telegram field")
+}
+
+pub fn object(value: Json) -> Result[Json, BotError] {
+    match value {
+        Json::Object(_) => {
+            ret Result::Ok(value)
+        }
+        _ => {
+            ret Result::Err(malformed())
+        }
+    }
+}
+pub fn field(value: Json, name: str) -> Result[Json, BotError] {
+    let _object = object(value)?
+    ret match value.get(name) {
+        Option::Some(value) => Result::Ok(value) Option::None => Result::Err(malformed())
+    }
+}
+pub fn text(value: Json) -> Result[str, BotError] {
+    ret match value {
+        Json::String(value) => Result::Ok(value) _ => Result::Err(malformed())
+    }
+}
+pub fn boolean(value: Json) -> Result[bool, BotError] {
+    ret match value {
+        Json::Bool(value) => Result::Ok(value) _ => Result::Err(malformed())
+    }
+}
+pub fn integer(value: Json) -> Result[i64, BotError] {
+    let source = match value {
+        Json::Number(value) => value _ => {
+            ret Result::Err(malformed())
+        }
+    }
+    if source == "" {
+        ret Result::Err(malformed())
+    }
+    let negative = source.byte_at(0_usize) == 45_u8
+    let start = if negative {
+        1_usize
+    } else {
+        0_usize
+    }
+    if source.len() == start {
+        ret Result::Err(malformed())
+    }
+    let limit = if negative {
+        9223372036854775808_u64
+    } else {
+        9223372036854775807_u64
+    }
+    let mut magnitude = 0_u64
+    for i in start..source.len() {
+        let b = source.byte_at(i)
+        if b < 48_u8 || b > 57_u8 {
+            ret Result::Err(malformed())
+        }
+        let digit =(b - 48_u8) as u64
+        if magnitude >(limit - digit) / 10_u64 {
+            ret Result::Err(malformed())
+        }
+        magnitude = magnitude * 10_u64 + digit
+    }
+    if negative && magnitude == 9223372036854775808_u64 {
+        ret Result::Ok( - 9223372036854775807_i64 - 1_i64)
+    }
+    ret Result::Ok(if negative {
+            -(magnitude as i64)
+        } else {
+            magnitude as i64
+        }
+    )
+}
+pub fn optional_text(value: Json, name: str) -> Result[Option[str], BotError] {
+    match value.get(name) {
+        Option::None => {
+            ret Result::Ok(Option::None)
+        }
+        Option::Some(value) => {
+            if value.is_null() {
+                ret Result::Ok(Option::None)
+            }
+            ret Result::Ok(Option::Some(text(value)?))
+        }
+    }
+}
+pub fn optional_integer(value: Json, name: str) -> Result[Option[i64], BotError] {
+    match value.get(name) {
+        Option::None => {
+            ret Result::Ok(Option::None)
+        }
+        Option::Some(value) => {
+            if value.is_null() {
+                ret Result::Ok(Option::None)
+            }
+            ret Result::Ok(Option::Some(integer(value)?))
+        }
+    }
+}
+pub fn decode_user(value: Json) -> Result[User, BotError] {
+    ret Result::Ok(User {
+            integer(field(value, "id")?)?, boolean(field(value, "is_bot")?)?, text(field(value, "first_name")?)?, optional_text(value, "last_name")?, optional_text(value, "username")?, value
+        }
+        ,
+    )
+}
+pub fn decode_chat(value: Json) -> Result[Chat, BotError] {
+    ret Result::Ok(Chat {
+            integer(field(value, "id")?)?, text(field(value, "type")?)?, optional_text(value, "title")?, optional_text(value, "username")?, optional_text(value, "first_name")?, value
+        }
+        ,
+    )
+}
+pub fn decode_document(value: Json) -> Result[Document, BotError] {
+    ret Result::Ok(Document {
+            text(field(value, "file_id")?)?, text(field(value, "file_unique_id")?)?, optional_text(value, "file_name")?, optional_text(value, "mime_type")?, optional_integer(value, "file_size")?, value
+        }
+        ,
+    )
+}
+pub fn decode_file(value: Json) -> Result[File, BotError] {
+    ret Result::Ok(File {
+            text(field(value, "file_id")?)?, text(field(value, "file_unique_id")?)?, optional_integer(value, "file_size")?, optional_text(value, "file_path")?, value
+        }
+        ,
+    )
+}
+pub fn decode_message(value: Json) -> Result[Message, BotError] {
+    let from: Option[User] = match value.get("from") {
+        Option::Some(value) => {
+            if value.is_null() {
+                Option[User]::None
+            } else {
+                Option[User]::Some(decode_user(value)?)
+            }
+        }
+        Option::None => Option[User]::None
+    }
+    let document: Option[Document] = match value.get("document") {
+        Option::Some(value) => {
+            if value.is_null() {
+                Option[Document]::None
+            } else {
+                Option[Document]::Some(decode_document(value)?)
+            }
+        }
+        Option::None => Option[Document]::None
+    }
+    ret Result::Ok(Message {
+            integer(field(value, "message_id")?)?, integer(field(value, "date")?)?, decode_chat(field(value, "chat")?)?, from, optional_text(value, "text")?, optional_text(value, "caption")?, document, value
+        }
+        ,
+    )
+}
+pub fn optional_message(value: Json, name: str) -> Result[Option[Message], BotError] {
+    ret match value.get(name) {
+        Option::Some(value) => {
+            if value.is_null() {
+                Result::Ok(Option::None)
+            } else {
+                Result::Ok(Option::Some(decode_message(value)?))
+            }
+        }
+        Option::None => Result::Ok(Option::None)
+    }
+}
+pub fn decode_callback(value: Json) -> Result[CallbackQuery, BotError] {
+    ret Result::Ok(CallbackQuery {
+            text(field(value, "id")?)?, decode_user(field(value, "from")?)?, text(field(value, "chat_instance")?)?, optional_text(value, "data")?, optional_message(value, "message")?, optional_text(value, "inline_message_id")?, value
+        }
+        ,
+    )
+}
+pub fn decode_update(value: Json) -> Result[Update, BotError] {
+    let callback: Option[CallbackQuery] = match value.get("callback_query") {
+        Option::Some(value) => {
+            if value.is_null() {
+                Option[CallbackQuery]::None
+            } else {
+                Option[CallbackQuery]::Some(decode_callback(value)?)
+            }
+        }
+        Option::None => Option[CallbackQuery]::None
+    }
+    ret Result::Ok(Update {
+            integer(field(value, "update_id")?)?, optional_message(value, "message")?, optional_message(value, "edited_message")?, optional_message(value, "channel_post")?, optional_message(value, "edited_channel_post")?, callback, value
+        }
+        ,
+    )
+}
+pub fn decode_updates(value: Json) -> Result[Vec[Update], BotError] {
+    let items = match value {
+        Json::Array(items) => items _ => {
+            ret Result::Err(malformed())
+        }
+    }
+    let mut updates = Vec[Update]::new()
+    for item in items {
+        updates.push(decode_update(item)?)
+    }
+    ret Result::Ok(updates)
+}
+
+#attr(test)
+fn exact_signed_identifiers() -> bool {
+    ret integer(Json::Number("-9223372036854775808")).unwrap_or(0_i64) ==( - 9223372036854775807_i64 - 1_i64)
+    && integer(Json::Number("9007199254740993")).unwrap_or(0_i64) == 9007199254740993_i64
+    && integer(Json::Number("9223372036854775808")).is_err()
+    && integer(Json::Number("1.5")).is_err()
+}
+
+#attr(test)
+fn unknown_update_is_preserved() -> bool {
+    let value = json::parse("{\"update_id\":9,\"future_event\":{\"text\":\"новое\"}}").unwrap_or(Json::Null)
+    let update = match decode_update(value) {
+        Result::Ok(value) => value Result::Err(_) => {
+            ret false
+        }
+    }
+    ret update.update_id == 9_i64 && update.raw.get("future_event").is_some() && update.message.is_none()
+}
+
+#attr(test)
+fn document_and_callback_updates() -> bool {
+    let doc = json::parse("{\"update_id\":1,\"message\":{\"message_id\":2,\"date\":3,\"chat\":{\"id\":-1001234567890,\"type\":\"private\"},\"document\":{\"file_id\":\"f\",\"file_unique_id\":\"u\",\"file_name\":\"CV.pdf\"}}}").unwrap_or(Json::Null)
+    let update = match decode_update(doc) {
+        Result::Ok(value) => value Result::Err(_) => {
+            ret false
+        }
+    }
+    let message = match update.message {
+        Option::Some(value) => value Option::None => {
+            ret false
+        }
+    }
+    if message.chat.id != - 1001234567890_i64 || message.document.is_none() {
+        ret false
+    }
+    let callback = json::parse("{\"id\":\"q\",\"from\":{\"id\":1,\"is_bot\":false,\"first_name\":\"Женя\"},\"chat_instance\":\"c\",\"data\":\"approve:2\"}").unwrap_or(Json::Null)
+    ret decode_callback(callback).is_ok()
+}
+
+#attr(test)
+fn missing_and_wrong_fields_are_errors() -> bool {
+    let missing = json::parse("{\"id\":1,\"is_bot\":true}").unwrap_or(Json::Null)
+    let wrong = json::parse("{\"id\":1,\"is_bot\":true,\"first_name\":\"bot\",\"username\":7}").unwrap_or(Json::Null)
+    ret decode_user(missing).is_err() && decode_user(wrong).is_err()
+}

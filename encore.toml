@@ -1,0 +1,12 @@
+[project]
+name = "telebot"
+version = "0.1.0"
+encore = ">=0.1.6"
+description = "Typed, nonblocking Telegram Bot API for Encore"
+licence = "MIT"
+readme = "README.md"
+dependencies = [
+    "index@std@0.0.8",
+    "index@json@0.0.4",
+    "sys@core",
+]

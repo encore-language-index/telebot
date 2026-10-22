@@ -1,0 +1,26 @@
+//! Errors never include the bot token or request URL.
+import core::option::Option
+import std::http::HTTPError
+
+pub enum ErrorKind {
+    Configuration
+    Transport
+    Http
+    Protocol
+    Api
+    Limit
+}
+pub struct BotError {
+    kind: ErrorKind
+    message: str
+    http_status: u16
+    api_code: Option[i64]
+    retry_after: Option[i64]
+    migrate_to_chat_id: Option[i64]
+    transport: Option[HTTPError]
+}
+pub fn error(kind: ErrorKind, message: str) -> BotError {
+    ret BotError {
+        kind, message, 0_u16, Option[i64]::None, Option[i64]::None, Option[i64]::None, Option[HTTPError]::None
+    }
+}

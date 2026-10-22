@@ -1,0 +1,440 @@
+//! Typed Telegram Bot API futures. Offsets, retries and application state belong
+//! to the caller. Use await, or std::future::block_on at a synchronous entrypoint.
+import core::future::{Context, Future, Poll}
+import core::option::Option
+import core::result::Result
+import core::vec::Vec
+import json::Json
+import mod::models
+import mod::wire
+import std::http::{HTTPAsyncClient, HttpClientConfig, HTTPResponseFuture, HTTPCancellationToken, HttpRequest, Url}
+pub import mod::errors::*
+pub import mod::models::*
+pub import mod::wire::{ChatId, ButtonAction, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, SendMessage, EditMessageText, GetUpdates, AnswerCallbackQuery}
+
+/// Custom origins also permit a local Bot API server and local integration tests.
+pub struct BotConfig {
+    api_base: str
+    file_base: str
+    http: HttpClientConfig
+    max_file_bytes: usize
+    file_timeout_ms: usize
+}
+
+impl for BotConfig {
+    pub fn default() -> Self {
+        ret Self {
+            "https://api.telegram.org", "https://api.telegram.org", HttpClientConfig::default(), 20971520_usize, 60000_usize
+        }
+    }
+    pub fn with_endpoints(self: Self, api_base: str, file_base: str) -> Self {
+        ret Self {
+            api_base, file_base, self.http, self.max_file_bytes, self.file_timeout_ms
+        }
+    }
+    pub fn with_http_config(self: Self, http: HttpClientConfig) -> Self {
+        ret Self {
+            self.api_base, self.file_base, http, self.max_file_bytes, self.file_timeout_ms
+        }
+    }
+    pub fn with_file_limits(self: Self, max_bytes: usize, timeout_ms: usize) -> Self {
+        ret Self {
+            self.api_base, self.file_base, self.http, max_bytes, timeout_ms
+        }
+    }
+}
+
+/// Do not format or log this value: it owns a bot credential.
+pub struct BotClient {
+    http: HTTPAsyncClient
+    token: str
+    config: BotConfig
+    cancellation: Option[HTTPCancellationToken]
+}
+
+impl for BotClient {
+    pub fn new(http: HTTPAsyncClient, token: str) -> Result[Self, BotError] {
+        let _valid = wire::validate_token(token)?
+        ret Result::Ok(Self {
+                http, token, BotConfig::default(), Option[HTTPCancellationToken]::None
+            }
+            ,
+        )
+    }
+    pub fn with_config(self: Self, config: BotConfig) -> Result[Self, BotError] {
+        let _api = wire::validate_base(config.api_base)?
+        let _file = wire::validate_base(config.file_base)?
+        if config.max_file_bytes == 0_usize || config.max_file_bytes > 1073741824_usize || config.file_timeout_ms == 0_usize || config.file_timeout_ms > 86400000_usize {
+            ret Result::Err(error(ErrorKind::Configuration, "invalid download limits"))
+        }
+        ret Result::Ok(Self { self.http, self.token, config, self.cancellation })
+    }
+    pub fn with_cancellation(self: Self, token: HTTPCancellationToken) -> Self {
+        ret Self {
+            self.http, self.token, self.config, Option::Some(token)
+        }
+    }
+    fn call(self: Self, method: str, body: Result[Json, BotError], timeout_ms: usize) -> ApiFuture {
+        let value = match body {
+            Result::Ok(value) => value
+            Result::Err(error) => {
+                ret ApiFuture {
+                    Option[HTTPResponseFuture]::None, Option::Some(error), self.token
+                }
+            }
+        }
+        let timeout = if timeout_ms > self.config.http.timeout_ms {
+            timeout_ms
+        } else {
+            self.config.http.timeout_ms
+        }
+        let config = self.config.http.with_timeout_ms(timeout)
+        match transport_request(self.http, config, "POST", self.config.api_base + "/bot" + self.token + "/" + method, json::stringify(value), self.cancellation, true) {
+            Result::Ok(future) => {
+                ret ApiFuture {
+                    Option::Some(future), Option[BotError]::None, self.token
+                }
+            }
+            Result::Err(error) => {
+                ret ApiFuture {
+                    Option[HTTPResponseFuture]::None, Option::Some(error), self.token
+                }
+            }
+        }
+    }
+    pub fn get_me(self: Self) -> GetMeFuture {
+        ret GetMeFuture {
+            self.call("getMe", Result::Ok(Json::Object(Vec[(str, Json)]::new())), 0_usize)
+        }
+    }
+    pub fn get_updates(self: Self, options: GetUpdates) -> GetUpdatesFuture {
+        ret GetUpdatesFuture {
+            self.call("getUpdates", wire::updates(options),(options.timeout as usize + 10_usize) * 1000_usize)
+        }
+    }
+    pub fn send_message(self: Self, options: SendMessage) -> SendMessageFuture {
+        ret SendMessageFuture {
+            self.call("sendMessage", wire::send(options), 0_usize)
+        }
+    }
+    pub fn edit_message_text(self: Self, options: EditMessageText) -> EditMessageTextFuture {
+        ret EditMessageTextFuture {
+            self.call("editMessageText", wire::edit(options), 0_usize)
+        }
+    }
+    pub fn answer_callback_query(self: Self, options: AnswerCallbackQuery) -> AnswerCallbackQueryFuture {
+        ret AnswerCallbackQueryFuture {
+            self.call("answerCallbackQuery", wire::answer(options), 0_usize)
+        }
+    }
+    pub fn get_file(self: Self, file_id: str) -> GetFileFuture {
+        let body: Result[Json, BotError] = if file_id == "" {
+            Result[Json, BotError]::Err(error(ErrorKind::Configuration, "file ID is empty"))
+        } else {
+            Result[Json, BotError]::Ok(Json::Object(vec![("file_id", Json::String(file_id))]))
+        }
+        ret GetFileFuture { self.call("getFile", body, 0_usize) }
+    }
+    pub fn download_file(self: Self, file: File) -> DownloadFileFuture {
+        let path = match file.file_path {
+            Option::Some(value) => value
+            Option::None => {
+                ret DownloadFileFuture {
+                    Option[HTTPResponseFuture]::None, Option::Some(error(ErrorKind::Configuration, "getFile returned no file_path"))
+                }
+            }
+        }
+        match wire::validate_file_path(path) {
+            Result::Ok(_) => {
+            }
+            Result::Err(error) => {
+                ret DownloadFileFuture {
+                    Option[HTTPResponseFuture]::None, Option::Some(error)
+                }
+            }
+        }
+        match file.file_size {
+            Option::Some(size) => {
+                if size < 0_i64 || size as u64 > self.config.max_file_bytes as u64 {
+                    ret DownloadFileFuture {
+                        Option[HTTPResponseFuture]::None, Option::Some(error(ErrorKind::Limit, "document exceeds configured download limit"))
+                    }
+                }
+            }
+            Option::None => {
+            }
+        }
+        let config = self.config.http.with_max_body_size(self.config.max_file_bytes).with_timeout_ms(self.config.file_timeout_ms)
+        match transport_request(self.http, config, "GET", self.config.file_base + "/file/bot" + self.token + "/" + path, "", self.cancellation, false) {
+            Result::Ok(future) => {
+                ret DownloadFileFuture {
+                    Option::Some(future), Option[BotError]::None
+                }
+            }
+            Result::Err(error) => {
+                ret DownloadFileFuture {
+                    Option[HTTPResponseFuture]::None, Option::Some(error)
+                }
+            }
+        }
+    }
+}
+
+/// Internal envelope future shared by concrete, publicly nameable method futures.
+pub struct ApiFuture {
+    inner: Option[HTTPResponseFuture]
+    immediate: Option[BotError]
+    token: str
+}
+
+impl Future[Result[Json, BotError]] for ApiFuture {
+    fn poll(self: Self, context: Context) -> Poll[Self, Result[Json, BotError]] {
+        match self.immediate {
+            Option::Some(error) => {
+                ret Poll::Ready(Result::Err(error))
+            }
+            Option::None => {
+            }
+        }
+        let request = match self.inner {
+            Option::Some(value) => value Option::None => {
+                ret Poll::Ready(Result::Err(error(ErrorKind::Protocol, "completed Telegram future polled again")))
+            }
+        }
+        match request.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self {
+                        Option::Some(next), Option[BotError]::None, self.token
+                    }
+                    ,
+                )
+            }
+            Poll::Ready(outcome) => {
+                match outcome {
+                    Result::Err(error) => {
+                        ret Poll::Ready(Result::Err(wire::transport(error)))
+                    }
+                    Result::Ok(response) => {
+                        ret Poll::Ready(wire::envelope(response, self.token))
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub struct DownloadFileFuture {
+    inner: Option[HTTPResponseFuture]
+    immediate: Option[BotError]
+}
+
+impl Future[Result[DownloadedFile, BotError]] for DownloadFileFuture {
+    fn poll(self: Self, context: Context) -> Poll[Self, Result[DownloadedFile, BotError]] {
+        match self.immediate {
+            Option::Some(error) => {
+                ret Poll::Ready(Result::Err(error))
+            }
+            Option::None => {
+            }
+        }
+        let request = match self.inner {
+            Option::Some(value) => value Option::None => {
+                ret Poll::Ready(Result::Err(error(ErrorKind::Protocol, "completed download future polled again")))
+            }
+        }
+        match request.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self {
+                        Option::Some(next), Option[BotError]::None
+                    }
+                    ,
+                )
+            }
+            Poll::Ready(outcome) => {
+                let response = match outcome {
+                    Result::Ok(value) => value Result::Err(error) => {
+                        ret Poll::Ready(Result::Err(wire::transport(error)))
+                    }
+                }
+                if response.status() != 200_u16 {
+                    let mut failure = error(ErrorKind::Http, "Telegram file download failed")
+                    failure.http_status = response.status()
+                    ret Poll::Ready(Result::Err(failure))
+                }
+                ret Poll::Ready(Result::Ok(DownloadedFile { response.body(), response.body().len() }))
+            }
+        }
+    }
+}
+
+/// Typed asynchronous Bot API operation; a single-consumer future.
+pub struct GetMeFuture {
+    inner: ApiFuture
+}
+
+impl Future[Result[User, BotError]] for GetMeFuture {
+    fn poll(self: Self, context: Context) -> Poll[Self, Result[User, BotError]] {
+        match self.inner.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self { next })
+            }
+            Poll::Ready(outcome) => {
+                match outcome {
+                    Result::Err(error) => {
+                        ret Poll::Ready(Result::Err(error))
+                    }
+                    Result::Ok(value) => {
+                        ret Poll::Ready(models::decode_user(value))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Typed asynchronous Bot API operation; a single-consumer future.
+pub struct GetUpdatesFuture {
+    inner: ApiFuture
+}
+
+impl Future[Result[Vec[Update], BotError]] for GetUpdatesFuture {
+    fn poll(self: Self, context: Context) -> Poll[Self, Result[Vec[Update], BotError]] {
+        match self.inner.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self { next })
+            }
+            Poll::Ready(outcome) => {
+                match outcome {
+                    Result::Err(error) => {
+                        ret Poll::Ready(Result::Err(error))
+                    }
+                    Result::Ok(value) => {
+                        ret Poll::Ready(models::decode_updates(value))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Typed asynchronous Bot API operation; a single-consumer future.
+pub struct SendMessageFuture {
+    inner: ApiFuture
+}
+
+impl Future[Result[Message, BotError]] for SendMessageFuture {
+    fn poll(self: Self, context: Context) -> Poll[Self, Result[Message, BotError]] {
+        match self.inner.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self { next })
+            }
+            Poll::Ready(outcome) => {
+                match outcome {
+                    Result::Err(error) => {
+                        ret Poll::Ready(Result::Err(error))
+                    }
+                    Result::Ok(value) => {
+                        ret Poll::Ready(models::decode_message(value))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Typed asynchronous Bot API operation; a single-consumer future.
+pub struct EditMessageTextFuture {
+    inner: ApiFuture
+}
+
+impl Future[Result[Message, BotError]] for EditMessageTextFuture {
+    fn poll(self: Self, context: Context) -> Poll[Self, Result[Message, BotError]] {
+        match self.inner.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self { next })
+            }
+            Poll::Ready(outcome) => {
+                match outcome {
+                    Result::Err(error) => {
+                        ret Poll::Ready(Result::Err(error))
+                    }
+                    Result::Ok(value) => {
+                        ret Poll::Ready(models::decode_message(value))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Typed asynchronous Bot API operation; a single-consumer future.
+pub struct AnswerCallbackQueryFuture {
+    inner: ApiFuture
+}
+
+impl Future[Result[bool, BotError]] for AnswerCallbackQueryFuture {
+    fn poll(self: Self, context: Context) -> Poll[Self, Result[bool, BotError]] {
+        match self.inner.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self { next })
+            }
+            Poll::Ready(outcome) => {
+                match outcome {
+                    Result::Err(error) => {
+                        ret Poll::Ready(Result::Err(error))
+                    }
+                    Result::Ok(value) => {
+                        ret Poll::Ready(models::boolean(value))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Typed asynchronous Bot API operation; a single-consumer future.
+pub struct GetFileFuture {
+    inner: ApiFuture
+}
+
+impl Future[Result[File, BotError]] for GetFileFuture {
+    fn poll(self: Self, context: Context) -> Poll[Self, Result[File, BotError]] {
+        match self.inner.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self { next })
+            }
+            Poll::Ready(outcome) => {
+                match outcome {
+                    Result::Err(error) => {
+                        ret Poll::Ready(Result::Err(error))
+                    }
+                    Result::Ok(value) => {
+                        ret Poll::Ready(models::decode_file(value))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn transport_request(http: HTTPAsyncClient, config: HttpClientConfig, method: str, address: str, body: str, cancellation: Option[HTTPCancellationToken], json_body: bool) -> Result[HTTPResponseFuture, BotError] {
+    let url = match Url::parse(address) {
+        Result::Ok(url) => url
+        Result::Err(_) => {
+            ret Result::Err(error(ErrorKind::Configuration, "invalid Bot API request URL"))
+        }
+    }
+    let mut request = HttpRequest::new(method, url).with_body(body)
+    if json_body {
+        request = request.with_header("Content-Type", "application/json")
+    }
+    let mut future = http.with_config(config).send(request)
+    match cancellation {
+        Option::Some(token) => {
+            future = future.with_cancellation(token)
+        }
+        Option::None => {
+        }
+    }
+    ret Result::Ok(future)
+}
